@@ -1,0 +1,9 @@
+{
+    "runtime": "python",
+    "entrypoint": "app:app",
+    "graphs": {
+      "default": "app:app"
+    },
+    "dependencies": ["./"]
+}
+  
