@@ -1,6 +1,6 @@
 # --- 커스텀 PG retriever: 임베딩 테이블 + 본문 테이블 JOIN ---
 from sqlalchemy import create_engine, text
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 class PGRawRetriever:
     def __init__(
