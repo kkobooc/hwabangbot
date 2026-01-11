@@ -5,6 +5,7 @@ content_processor.py
 - Storybook 콘텐츠 전처리 및 분석
 - Likes/Views 상위 콘텐츠 추출 및 JSON 파싱
 """
+import os
 import json
 import logging
 import re
@@ -16,7 +17,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = "postgresql://bdlab:bdlab25!!@postgresql.blendedlabs.xyz:5432/hwabang"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise SystemExit("DATABASE_URL 환경변수가 필요합니다")
+
+# 테이블 자동 생성
+from db_init import init_tables
+init_tables()
 
 def conn():
     return psycopg2.connect(DATABASE_URL)
@@ -37,32 +44,6 @@ def qe(sql, params=None, many=False):
             psycopg2.extras.execute_batch(cur, sql, params, page_size=500)
         else:
             cur.execute(sql, params)
-
-def create_processed_content_table():
-    """전처리된 콘텐츠를 저장할 테이블 생성"""
-    sql = """
-    CREATE TABLE IF NOT EXISTS processed_content (
-        id SERIAL PRIMARY KEY,
-        content_pk INTEGER NOT NULL,
-        mall_id VARCHAR(50) NOT NULL,
-        board_no INTEGER NOT NULL,
-        title TEXT,
-        likes INTEGER,
-        views INTEGER,
-        published BOOLEAN,
-        modified_at TIMESTAMP WITH TIME ZONE,
-        hashtags TEXT[],  -- 배열로 저장
-        text_content TEXT,  -- 텍스트 내용
-        text_length INTEGER,  -- 텍스트 길이
-        image_url TEXT,  -- 단일 이미지 URL
-        products TEXT[],  -- 상품 번호 배열
-        detail_url TEXT,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-        UNIQUE(content_pk, mall_id, board_no)
-    )
-    """
-    qe(sql)
-    logging.info("processed_content 테이블 생성 완료")
 
 def clean_html_tags(text):
     """HTML 태그 제거 및 텍스트 정리"""
@@ -157,8 +138,8 @@ def parse_content_document(raw_json):
             'detail_url': ''
         }
 
-def get_top_content_intersection(mall_id=None, board_no=None, percentile=3):
-    """Likes와 Views 상위 N% 교집합 조회 (percentile=3이면 상위 33%)"""
+def get_top_content_intersection(mall_id=None, board_no=None, percentile=2):
+    """Likes와 Views 상위 N% 교집합 조회 (percentile=2이면 상위 50%)"""
     sql = """
     SELECT 
         content_pk,
@@ -233,11 +214,8 @@ def upsert_processed_content(content_data):
     qe(sql, content_data)
     logging.info(f"Processed content saved: content_pk={content_data[0]}")
 
-def process_top_content(mall_id=None, board_no=None, percentile=3, min_text_length=500):
+def process_top_content(mall_id=None, board_no=None, percentile=2, min_text_length=500):
     """상위 콘텐츠를 전처리하여 새로운 테이블에 저장"""
-    # 테이블 생성
-    create_processed_content_table()
-    
     # 상위 콘텐츠 조회
     top_contents = get_top_content_intersection(mall_id, board_no, percentile)
     logging.info(f"Found {len(top_contents)} top content items (top {100//percentile}%)")
@@ -322,7 +300,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Storybook 콘텐츠 전처리")
     parser.add_argument("--mall-id", help="Mall ID")
     parser.add_argument("--board-no", type=int, help="Board number")
-    parser.add_argument("--percentile", type=int, default=3, help="상위 N% (기본값: 3 = 상위 33%)")
+    parser.add_argument("--percentile", type=int, default=2, help="상위 N% (기본값: 2 = 상위 50%)")
     parser.add_argument("--min-text-length", type=int, default=500, help="최소 텍스트 길이 (기본값: 500)")
     parser.add_argument("--stats", action="store_true", help="통계 조회")
     parser.add_argument("--hashtags", action="store_true", help="인기 해시태그 조회")

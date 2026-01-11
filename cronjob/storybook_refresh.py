@@ -13,15 +13,21 @@ import argparse
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+# 테이블 자동 생성
+from db_init import init_tables
+init_tables()
+
 BASE_URL = "https://sb-openapi.sweetoffer.co.kr"
 API_VERSION = os.getenv("API_VERSION", "20250806")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://bdlab:bdlab25!!@postgresql.blendedlabs.xyz:5432/hwabang")
-INIT_MALL_ID = os.getenv("MALL_ID", "kangkd78910")
-INIT_ACCESS_KEY = os.getenv("ACCESS_KEY", "f0968a675feb1cd8823d1beae13a4eaf")
-INIT_SECRET_KEY = os.getenv("SECRET_KEY", "b11979084a2051dc1fc22a0f9a39c33e2214ad50d763c1c58dd3092ca57b66fc0ac01bb675a5396402e8fdaa8eafc4ba10798ebea3dc16280b16603ec1aec0f8")
-INIT_SECRET_KEY_EXPIRES_AT = os.getenv("SECRET_KEY_EXPIRES_AT", "2025-08-19T11:23:58+09:00")
-INIT_REFRESH_KEY = os.getenv("REFRESH_KEY", "94f4441590d538f9d7749f5ca137b72db864cd4c38a3c46f3403e47762cecf4daf76e9fd4506ab8b474bd934b43e4df498603fc8ae50ab4a157c05b7b3af8b81")
-INIT_REFRESH_KEY_EXPIRES_AT = os.getenv("REFRESH_KEY_EXPIRES_AT", "2025-08-28T11:23:58+09:00")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise SystemExit("DATABASE_URL 환경변수가 필요합니다")
+INIT_MALL_ID = os.getenv("MALL_ID")
+INIT_ACCESS_KEY = os.getenv("ACCESS_KEY")
+INIT_SECRET_KEY = os.getenv("SECRET_KEY")
+INIT_SECRET_KEY_EXPIRES_AT = os.getenv("SECRET_KEY_EXPIRES_AT")
+INIT_REFRESH_KEY = os.getenv("REFRESH_KEY")
+INIT_REFRESH_KEY_EXPIRES_AT = os.getenv("REFRESH_KEY_EXPIRES_AT")
 
 SLEEP_REFRESH = 1.05          # 초당 1회
 RENEW_THRESHOLD_SEC = 3600    # 남은 1시간 이하면 갱신

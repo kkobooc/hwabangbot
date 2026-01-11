@@ -24,12 +24,12 @@ pip install -r requirements.txt
 python -m uvicorn api:api --host 0.0.0.0 --port 1387 --reload   # Run FastAPI server
 ```
 
-### Cronjob Scripts
+### Cronjob Scripts (ETL Pipeline)
 ```bash
 cd cronjob
 pip install -r requirements.txt
-python storybook_ingest.py      # Fetch content from SweetOffer API
-python content_processor.py     # Process content for embeddings
+python storybook_ingest.py --mall-id $MALL_ID   # 1. Fetch from SweetOffer API
+python embedding_sync.py                         # 2. Generate embeddings (includes content_processor)
 ```
 
 ## Architecture
@@ -72,11 +72,22 @@ Copy `backend/.env.example` to `backend/.env`:
 
 - `backend/system_prompt_ko.md`: Korean system prompt defining curator behavior and output format
 - `backend/langgraph.json`: LangGraph deployment config
-- `cronjob/ddl/processed_content.sql`: Database schema for content and embeddings
+- `cronjob/ddl/schema.sql`: Database schema for all tables
 - `frontend/components.json`: shadcn/ui component configuration
 
 ## Deployment
 
-- **Frontend**: Vercel (auto-synced from v0.app)
-- **Backend**: GCP instance at 34.64.194.4:1387
-- **Database**: PostgreSQL with pgvector at postgresql.blendedlabs.xyz
+Railway 배포: `RAILWAY.md` 참조
+
+```
+Railway Project
+├── PostgreSQL (Plugin)     # pgvector 지원
+├── backend (Service)       # FastAPI - Dockerfile
+├── frontend (Service)      # Next.js - 자동 감지
+└── cronjob (Cron Service)  # ETL Pipeline - Dockerfile
+```
+
+### 환경변수
+- **Backend**: `DATABASE_URL`, `PG_CONN`, `OPENAI_API_KEY`
+- **Frontend**: `BACKEND_URL` (backend 서비스 URL)
+- **Cronjob**: `DATABASE_URL`, `OPENAI_API_KEY`, `MALL_ID`, API keys

@@ -10,9 +10,9 @@ export async function GET(req: Request) {
 
     console.log("GET SSE API called with:", { query, thread_id })
 
-    const backendUrl = "http://34.64.194.4:1387/stream"
+    const baseUrl = process.env.BACKEND_URL || "http://34.64.194.4:1387"
 
-    const response = await fetch(backendUrl, {
+    const response = await fetch(`${baseUrl}/stream`, {
       method: "POST", // 백엔드는 POST 유지
       headers: {
         "Content-Type": "application/json",

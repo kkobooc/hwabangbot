@@ -1,0 +1,10 @@
+# hwabangbot ETL Pipeline Cron Schedule
+# 로컬 서버에서 사용 시: crontab -e 후 아래 내용 추가
+#
+# 환경변수 설정 필요:
+#   export DATABASE_URL=...
+#   export OPENAI_API_KEY=...
+#   export MALL_ID=...
+
+# 매일 새벽 3시 (KST) 실행
+0 3 * * * cd /path/to/hwabangbot/cronjob && /usr/bin/python3 storybook_ingest.py --mall-id $MALL_ID && /usr/bin/python3 embedding_sync.py >> /var/log/hwabangbot.log 2>&1
