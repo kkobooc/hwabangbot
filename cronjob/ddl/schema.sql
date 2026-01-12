@@ -162,7 +162,7 @@ CREATE INDEX IF NOT EXISTS idx_processed_content_modified_at ON processed_conten
 CREATE INDEX IF NOT EXISTS idx_processed_content_hashtags ON processed_content USING GIN(hashtags);
 CREATE INDEX IF NOT EXISTS idx_processed_content_image_url ON processed_content(image_url);
 CREATE INDEX IF NOT EXISTS idx_processed_content_products ON processed_content USING GIN(products);
-CREATE INDEX IF NOT EXISTS idx_processed_content_text_content ON processed_content USING GIN(to_tsvector('korean', text_content));
+CREATE INDEX IF NOT EXISTS idx_processed_content_text_content ON processed_content USING GIN(to_tsvector('simple', text_content));
 
 COMMENT ON TABLE processed_content IS 'Storybook 콘텐츠 전처리 결과 테이블';
 COMMENT ON COLUMN processed_content.content_pk IS '콘텐츠 고유 ID';
