@@ -25,9 +25,13 @@ if not DATABASE_URL:
 INIT_MALL_ID = os.getenv("MALL_ID")
 INIT_ACCESS_KEY = os.getenv("ACCESS_KEY")
 INIT_SECRET_KEY = os.getenv("SECRET_KEY")
-INIT_SECRET_KEY_EXPIRES_AT = os.getenv("SECRET_KEY_EXPIRES_AT")
+# secret_key: 만료일 모르면 과거로 설정 → 무조건 갱신 시도
+# refresh_key: 10일 뒤로 설정
+DEFAULT_SECRET_EXPIRES = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()  # 과거 = 즉시 갱신
+DEFAULT_REFRESH_EXPIRES = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=10)).isoformat()
+INIT_SECRET_KEY_EXPIRES_AT = os.getenv("SECRET_KEY_EXPIRES_AT") or DEFAULT_SECRET_EXPIRES
 INIT_REFRESH_KEY = os.getenv("REFRESH_KEY")
-INIT_REFRESH_KEY_EXPIRES_AT = os.getenv("REFRESH_KEY_EXPIRES_AT")
+INIT_REFRESH_KEY_EXPIRES_AT = os.getenv("REFRESH_KEY_EXPIRES_AT") or DEFAULT_REFRESH_EXPIRES
 
 SLEEP_REFRESH = 1.05          # 초당 1회
 RENEW_THRESHOLD_SEC = 3600    # 남은 1시간 이하면 갱신
@@ -128,18 +132,29 @@ def log_refresh(mall_id: str, raw: dict, status: str, detail: str=None):
 
 def refresh_once(access_key: str, mall_id: str, refresh_key: str) -> bool:
     url = f"{BASE_URL}/refresh_keys/{access_key}/{mall_id}/new_secret_key/{refresh_key}"
+    logging.info(f"[Refresh] URL: {url[:80]}...{refresh_key[-8:]}")
     try:
         r = requests.get(url, verify=False, timeout=30)
         raw = r.json() if r.content else {}
         status = "success" if r.ok else f"failed_{r.status_code}"
         if r.status_code == 422:
             status = "skipped_422"
+
+        # 상세 로깅 추가
+        logging.info(f"[Refresh] status_code={r.status_code}")
+        if not r.ok:
+            logging.error(f"[Refresh] 실패 응답: {r.text[:500] if r.text else 'empty'}")
+            logging.error(f"[Refresh] raw JSON: {json.dumps(raw, ensure_ascii=False)[:500]}")
+        else:
+            logging.info(f"[Refresh] 성공 응답 data keys: {list(raw.get('result', {}).get('data', {}).keys())}")
+
         log_refresh(mall_id, raw, status, None if r.ok else r.text)
         if r.ok:
             upsert_current_keys_from_refresh_payload(mall_id, raw)
         time.sleep(SLEEP_REFRESH)
         return r.ok
     except Exception as e:
+        logging.error(f"[Refresh] 예외 발생: {e}")
         log_refresh(mall_id, {}, "failed_exception", str(e))
         time.sleep(SLEEP_REFRESH)
         return False

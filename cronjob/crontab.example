@@ -5,6 +5,15 @@
 #   export DATABASE_URL=...
 #   export OPENAI_API_KEY=...
 #   export MALL_ID=...
+#   export SWEETTRACKER_API_KEY=...
+#   export SWEETTRACKER_API_SECRET=...
+#
+# Railway 배포 시: railway.toml의 cronSchedule 사용 (UTC 기준)
 
 # 매일 새벽 3시 (KST) 실행
-0 3 * * * cd /path/to/hwabangbot/cronjob && /usr/bin/python3 storybook_ingest.py --mall-id $MALL_ID && /usr/bin/python3 embedding_sync.py >> /var/log/hwabangbot.log 2>&1
+# ETL Pipeline: refresh keys → ingest → embed
+0 3 * * * cd /path/to/hwabangbot/cronjob && \
+    /usr/bin/python3 storybook_refresh.py --mall-id $MALL_ID && \
+    /usr/bin/python3 storybook_ingest.py --mall-id $MALL_ID && \
+    /usr/bin/python3 embedding_sync.py \
+    >> /var/log/hwabangbot.log 2>&1

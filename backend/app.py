@@ -1,21 +1,28 @@
-import os, json
+import os, json, random, logging, sys
 from typing import Any, TypedDict, List, Literal, Optional
 from dotenv import load_dotenv
 
+print("[APP] app.py loading started", flush=True)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
+
+print("[APP] importing langchain modules...", flush=True)
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 
+print("[APP] importing langgraph modules...", flush=True)
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
-from langchain_core.tools import tool
-from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
 
+print("[APP] importing sqlalchemy...", flush=True)
 from sqlalchemy import create_engine
 from retriever import PGRawRetriever
 
 load_dotenv()
+print("[APP] dotenv loaded", flush=True)
 
 OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY")
 OPENAI_BASE_URL    = os.environ.get("OPENAI_BASE_URL") or None
@@ -24,7 +31,9 @@ LLM_TEMPERATURE    = float(os.environ.get("LLM_TEMPERATURE", "0.3"))
 EMBEDDING_MODEL    = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIM      = int(os.environ.get("EMBEDDING_DIM", "1536"))
 
+print("[APP] reading PG_CONN...", flush=True)
 PG_CONN             = os.environ["PG_CONN"]
+print(f"[APP] PG_CONN loaded (length={len(PG_CONN)})", flush=True)
 PGVECTOR_COLLECTION = os.environ.get("PGVECTOR_COLLECTION", "processed_content_embeddings")
 
 RETRIEVER_SEARCH_TYPE = os.environ.get("RETRIEVER_SEARCH_TYPE", "mmr")
@@ -54,6 +63,7 @@ else:
 
 # ---------------- LLM/Embeddings ----------------
 # (OPENAI_BASE_URL이 있으면 해당 엔드포인트 사용)
+print(f"[APP] Creating ChatOpenAI (model={LLM_MODEL})...", flush=True)
 llm = ChatOpenAI(
     model=LLM_MODEL,
     temperature=LLM_TEMPERATURE,
@@ -61,17 +71,23 @@ llm = ChatOpenAI(
     base_url=OPENAI_BASE_URL,
     tags=["final"]  # ← synthesize 노드에서 쓰는 LLM이라면 최종답에만 달기
 )
+print("[APP] ChatOpenAI created", flush=True)
 
+print(f"[APP] Creating OpenAIEmbeddings (model={EMBEDDING_MODEL})...", flush=True)
 emb = OpenAIEmbeddings(
     model=EMBEDDING_MODEL,
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL
 )
+print("[APP] OpenAIEmbeddings created", flush=True)
 
 # ---------------- PG Engine 생성 ----------------
+print("[APP] Creating SQLAlchemy engine...", flush=True)
 engine = create_engine(PG_CONN)
+print("[APP] SQLAlchemy engine created", flush=True)
 
 # ---------------- Retriever 초기화 ----------------
+print("[APP] Creating PGRawRetriever...", flush=True)
 retriever = PGRawRetriever(
     engine=engine,
     embeddings=emb,
@@ -81,6 +97,7 @@ retriever = PGRawRetriever(
     embedding_table="processed_content_embeddings",
     content_table="processed_content",
 )
+print("[APP] PGRawRetriever created", flush=True)
 
 # ---------------- 상태 정의 ----------------
 class QueryClassification(TypedDict):
@@ -91,6 +108,8 @@ class RAGState(TypedDict, total=False):
     query: str
     topic: Literal["art", "general"]
     confidence: float
+    # 검색용 키워드 (query_rewrite에서 생성)
+    search_keyword: str
     # 백워드 호환(없어도 동작)
     docs: List[Document]
     # 최종 출력
@@ -105,6 +124,7 @@ def _init_state(state: RAGState) -> RAGState:
     state.setdefault("errors", [])
     state.setdefault("topic", "general")
     state.setdefault("confidence", 0.0)
+    state.setdefault("search_keyword", "")
     return state
 
 # ---------------- Query Classifier ----------------
@@ -131,45 +151,104 @@ async def query_classifier(state: RAGState):
         state["errors"].append(f"classifier_error: {e}")
     return state
 
-# ---------------- ReAct Agent Tools ----------------
-@tool
-def search_content(query: str) -> str:
+# ---------------- Query Rewriter ----------------
+class KeywordExtraction(TypedDict):
+    keyword: str
+
+async def query_rewrite(state: RAGState):
+    """사용자 질문에서 미술 재료 검색용 키워드를 추출"""
+    state = _init_state(state)
+
+    rewrite_llm = llm.with_structured_output(KeywordExtraction).with_config({"run_name": "rewrite_llm"})
+
+    rewrite_prompt = """
+    사용자의 미술 관련 질문에서 **상품 검색에 사용할 핵심 키워드**를 1~3개 단어로 추출하세요.
+
+    예시:
+    - "유화 그릴 때 좋은 물감 추천해주세요" → "유화 물감"
+    - "수채화 초보자인데 어떤 붓이 좋을까요?" → "수채화 붓"
+    - "캔버스에 아크릴로 그리고 싶어요" → "아크릴 캔버스"
+    - "세밀한 스케치용 연필 뭐가 좋아요?" → "세목 연필"
+    - "마카로 일러스트 그리려고 해요" → "일러스트 마카"
+
+    규칙:
+    - 미술 재료/용품 카테고리를 포함 (물감, 붓, 캔버스, 연필, 팔레트 등)
+    - 재료 종류를 포함 (유화, 수채화, 아크릴, 파스텔 등)
+    - 간결하게 1~3단어로
+
+    질문: {query}
+    """
+
+    try:
+        result = await rewrite_llm.ainvoke(rewrite_prompt.format(query=state["query"]))
+        state["search_keyword"] = result["keyword"]
+        logging.info(f"[query_rewrite] 원본: '{state['query'][:50]}' → 키워드: '{state['search_keyword']}'")
+    except Exception as e:
+        # 실패 시 원본 쿼리 사용
+        state["search_keyword"] = state["query"]
+        state["errors"].append(f"query_rewrite_error: {e}")
+        logging.error(f"[query_rewrite] 오류: {e}, 원본 쿼리 사용")
+
+    return state
+
+# ---------------- 콘텐츠/상품 검색 함수 ----------------
+import asyncio
+
+def _search_content_sync(query: str) -> str:
     """미술 DB에서 관련 콘텐츠를 찾아 포맷팅된 문자열로 반환합니다."""
     try:
-        docs = retriever.invoke(query)[:min(RETRIEVER_K, 5)]
+        # 유사도 상위 10개를 가져와서 랜덤으로 3개 선택 (다양성 확보)
+        docs = retriever.invoke(query)[:10]
         if not docs:
             return "(검색결과 없음)"
-        
+
+        # 상위 10개 중 랜덤으로 3개 선택 (단, 최소 유사도 보장을 위해 상위 절반에서 2개, 하위 절반에서 1개)
+        if len(docs) >= 6:
+            top_half = docs[:5]
+            bottom_half = docs[5:10]
+            selected = random.sample(top_half, min(2, len(top_half))) + random.sample(bottom_half, min(1, len(bottom_half)))
+            random.shuffle(selected)
+        else:
+            selected = random.sample(docs, min(3, len(docs)))
+
         lines = []
-        for item in docs[:3]:  # 최대 3개만 표시
+        for i, item in enumerate(selected, 1):
             md = item.metadata or {}
             snippet = (item.page_content or "")[:MAX_DOC_CHARS] + "..."
-            
+
             lines.append(
-                f"- 콘텐츠제목: {md.get('title', '제목 없음')}\n"
-                f"  콘텐츠본문: {snippet}\n"
-                f"  콘텐츠URL: https://hwabang.net{md.get('detail_url', '')}\n"
-                f"  콘텐츠이미지: {md.get('image_url', '')}\n"
-                f"  관련상품: {md.get('products', '')}"
+                f"- 콘텐츠제목_{i}: {md.get('title', '제목 없음')}\n"
+                f"  콘텐츠본문_{i}: {snippet}\n"
+                f"  콘텐츠URL_{i}: https://hwabang.net{md.get('detail_url', '')}\n"
+                f"  콘텐츠이미지_{i}: {md.get('image_url', '')}\n"
+                f"  관련상품_{i}: {md.get('products', '')}"
             )
-        
+
         return "\n".join(lines)
     except Exception as e:
         return f"(검색 오류: {e})"
 
-@tool
-def fetch_recommendations(query: str) -> str:
+async def search_content(query: str) -> str:
+    """비동기 래퍼: 동기 retriever 호출을 별도 스레드에서 실행"""
+    return await asyncio.to_thread(_search_content_sync, query)
+
+async def fetch_recommendations(query: str) -> str:
     """추천 상품 API를 호출해 포맷팅된 문자열로 반환합니다."""
     import httpx
     api_url = "https://cafe24-recommendation-app-df9427a2b14e.herokuapp.com/api/v1/search-recommendations/kangkd78910"
     try:
-        with httpx.Client(timeout=10.0) as client:
-            r = client.get(api_url, params={"keyword": query, "limit": 5}, headers={"Accept": "application/json"})
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(api_url, params={"keyword": query, "limit": 5}, headers={"Accept": "application/json"})
             if r.status_code != 200:
                 return f"(추천상품 API 오류: {r.status_code})"
-            
+
             data = r.json()
             recs = data.get("recommendations", [])
+
+            # 디버그: 이미지 URL 확인 로깅
+            for i, rec in enumerate(recs[:5], 1):
+                img = rec.get('image_small', '')
+                logging.info(f"[추천상품 #{i}] name={rec.get('product_name', '')[:30]}, image_small={img[:80] if img else 'EMPTY'}")
             
             if not recs:
                 return "(추천상품 없음)"
@@ -192,6 +271,9 @@ def fetch_recommendations(query: str) -> str:
             for i, rec in enumerate(recs[:4], 1):
                 price = rec.get('price', '0')
                 sale_price = rec.get('sale_price', '0')
+                img_url = rec.get('image_small', '')
+                if not img_url:
+                    logging.warning(f"[추천상품 #{i}] 이미지 URL 누락! product_name={rec.get('product_name', '')}")
 
                 # 숫자 비교용 안전 변환
                 def to_int(val: Any) -> int:
@@ -216,10 +298,14 @@ def fetch_recommendations(query: str) -> str:
                     regular = max(p, s)
                     price_display = format_won(regular)
                     
+                # cafe24 도메인을 hwabang.net으로 변환
+                product_url = rec.get('product_url', '')
+                product_url = product_url.replace('kangkd78910.cafe24.com', 'hwabang.net')
+
                 out.append(
                     f"- 추천상품명{i}: {rec.get('product_name', '').replace('<br>', ' ')}\n"
                     f"  추천이미지{i}: {rec.get('image_small', '')}\n"
-                    f"  추천링크{i}: {rec.get('product_url', '')}\n"
+                    f"  추천링크{i}: {product_url}\n"
                     f"  추천상품번호{i}: {rec.get('product_no', '')}\n"
                     f"  추천상품가격{i}: {price_display}\n"
                 )
@@ -235,32 +321,57 @@ def fetch_recommendations(query: str) -> str:
 RAG_PROMPT = ChatPromptTemplate.from_messages([
     ("system", SYSTEM_PROMPT_TEXT),
     ("human",
-     "사용자 질문: {query}\n"
-     "다음은 DB에서 찾은 콘텐츠들이다(최대 3개). 각 항목은 제목, 본문, URL, 이미지URL, 관련상품 순서다:\n"
+     "사용자 질문: {query}\n\n"
+     "=== 관련 콘텐츠 (sources) ===\n"
      "{sources}\n\n"
-     "다음은 추천 상품들이다(최대 3개):\n"
+     "=== 추천 상품 (recommendations) ===\n"
      "{recommendations}\n\n"
-     "위 재료를 바탕으로 '콘텐츠별 요점 요약 → 전체 통합 해석 → 관련 콘텐츠/상품 블록' 형식으로 답변을 생성하라."
+     "중요 지시사항:\n"
+     "1. 관련 콘텐츠: sources 데이터에서 _1, _2, _3 (최대 3개)의 '콘텐츠제목', '콘텐츠URL', '콘텐츠이미지', '콘텐츠본문' 값을 모두 추출하여 출력 형식에 삽입하라.\n"
+     "2. 추천 상품: recommendations 데이터에서 1, 2, 3, 4 (최대 4개)의 '추천상품명', '추천이미지', '추천링크', '추천상품가격' 값을 모두 추출하여 출력 형식에 삽입하라.\n"
+     "3. URL과 이미지 URL은 절대 임의로 생성하지 말고, 반드시 위 데이터에서 제공된 값만 그대로 사용하라.\n"
+     "4. 제공된 데이터 개수만큼 모두 출력하라. 데이터가 4개면 4개 모두, 3개면 3개 모두 출력.\n"
     )
 ])
 
 async def synthesize_art(state: RAGState):
     """도구를 직접 호출하여 정보 수집 후 최종 답변 생성"""
     state = _init_state(state)
-    
-    # 검색 결과 가져오기 (이제 포맷팅된 문자열로 바로 반환)
-    try:
-        sources = search_content(state["query"])
-    except Exception as e:
-        sources = f"(검색 오류: {e})"
-        state["errors"].append(f"search_content error: {e}")
-    
-    # 추천 상품 가져오기 (이제 포맷팅된 문자열로 바로 반환)
-    try:
-        recommendations_text = fetch_recommendations(state["query"])
-    except Exception as e:
-        recommendations_text = f"(추천상품 오류: {e})"
-        state["errors"].append(f"fetch_recommendations error: {e}")
+
+    original_query = state["query"]
+    # search_keyword가 있으면 검색에 사용, 없으면 원본 쿼리 사용
+    search_kw = state.get("search_keyword") or original_query
+    logging.info(f"[synthesize_art] 시작: 원본='{original_query[:50]}', 검색키워드='{search_kw}'")
+
+    # 콘텐츠 검색 + 추천 상품 API 병렬 호출 (search_keyword 사용)
+    async def safe_search_content():
+        try:
+            result = await search_content(search_kw)
+            logging.info(f"[synthesize_art] search_content 성공 (키워드: {search_kw}, 길이: {len(result)})")
+            return result
+        except Exception as e:
+            logging.error(f"[synthesize_art] search_content 오류: {e}")
+            state["errors"].append(f"search_content error: {e}")
+            return f"(검색 오류: {e})"
+
+    async def safe_fetch_recommendations():
+        try:
+            result = await fetch_recommendations(search_kw)
+            logging.info(f"[synthesize_art] fetch_recommendations 성공 (키워드: {search_kw}, 길이: {len(result)})")
+            logging.info(f"[synthesize_art] recommendations 첫 300자: {result[:300]}")
+            return result
+        except Exception as e:
+            logging.error(f"[synthesize_art] fetch_recommendations 오류: {e}")
+            state["errors"].append(f"fetch_recommendations error: {e}")
+            return f"(추천상품 오류: {e})"
+
+    # 병렬 실행
+    sources, recommendations_text = await asyncio.gather(
+        safe_search_content(),
+        safe_fetch_recommendations()
+    )
+
+    logging.info(f"[synthesize_art] 최종 - sources 길이: {len(sources)}, recommendations 길이: {len(recommendations_text)}")
 
     # 대화 히스토리 포함: 직전 메시지들과 현재 질문을 함께 전달
     prior_messages: List[BaseMessage] = state.get("messages", [])
@@ -319,25 +430,32 @@ async def synthesize_general(state: RAGState):
 graph = StateGraph(RAGState)
 
 graph.add_node("classify", query_classifier)
+graph.add_node("query_rewrite", query_rewrite)
 graph.add_node("synthesize_art", synthesize_art)
 graph.add_node("synthesize_general", synthesize_general)
 
-# 최신 권장사항: START에서 진입 엣지를 명시적으로 추가
+# START → classify
 graph.add_edge(START, "classify")
 
+# classify → query_rewrite (art) 또는 synthesize_general (general)
 def route_after_classify(state: RAGState):
-    return "synthesize_art" if state["topic"] == "art" else "synthesize_general"
+    return "query_rewrite" if state["topic"] == "art" else "synthesize_general"
 
 graph.add_conditional_edges(
     "classify",
     route_after_classify,
-    {"synthesize_art": "synthesize_art", "synthesize_general": "synthesize_general"}
+    {"query_rewrite": "query_rewrite", "synthesize_general": "synthesize_general"}
 )
+
+# query_rewrite → synthesize_art
+graph.add_edge("query_rewrite", "synthesize_art")
 
 graph.add_edge("synthesize_art", END)
 graph.add_edge("synthesize_general", END)
 
+print("[APP] Compiling graph...", flush=True)
 app = graph.compile(checkpointer=MemorySaver())
+print("[APP] ========== app.py fully loaded ==========", flush=True)
 
 # ---------------- Run ----------------
 # if __name__ == "__main__":

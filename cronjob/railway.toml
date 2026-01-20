@@ -1,0 +1,6 @@
+[deploy]
+# KST 새벽 3시 = UTC 18시 (전날)
+# cronSchedule = "0 18 * * *"
+
+# ETL Pipeline with logging
+startCommand = "sh -c 'echo [ETL] Starting... && python -u storybook_refresh.py --mall-id ${MALL_ID} && echo [ETL] Step 2/3 && python -u storybook_ingest.py --mall-id ${MALL_ID} && echo [ETL] Step 3/3 && python -u embedding_sync.py && echo [ETL] Done'"

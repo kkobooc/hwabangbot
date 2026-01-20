@@ -36,13 +36,17 @@ if not DATABASE_URL:
 INIT_MALL_ID = os.getenv("MALL_ID")
 INIT_ACCESS_KEY = os.getenv("ACCESS_KEY")
 INIT_SECRET_KEY = os.getenv("SECRET_KEY")
-INIT_SECRET_KEY_EXPIRES_AT = os.getenv("SECRET_KEY_EXPIRES_AT")
+# secret_key: 만료일 모르면 과거로 설정 → 무조건 갱신 시도
+# refresh_key: 10일 뒤로 설정
+DEFAULT_SECRET_EXPIRES = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()  # 과거 = 즉시 갱신
+DEFAULT_REFRESH_EXPIRES = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=10)).isoformat()
+INIT_SECRET_KEY_EXPIRES_AT = os.getenv("SECRET_KEY_EXPIRES_AT") or DEFAULT_SECRET_EXPIRES
 INIT_REFRESH_KEY = os.getenv("REFRESH_KEY")
-INIT_REFRESH_KEY_EXPIRES_AT = os.getenv("REFRESH_KEY_EXPIRES_AT")
+INIT_REFRESH_KEY_EXPIRES_AT = os.getenv("REFRESH_KEY_EXPIRES_AT") or DEFAULT_REFRESH_EXPIRES
 
-# rate limits
-SLEEP_REFRESH = 1.2     # refresh 초당 1회
-SLEEP_CONTENT = 0.3     # contents 초당 5회 여유
+# rate limits (여유 있게 설정)
+SLEEP_REFRESH = 2.0     # refresh API 호출 간 대기
+SLEEP_CONTENT = 1.0     # contents API 호출 간 대기
 
 RENEW_THRESHOLD_SEC = 3600
 
@@ -188,12 +192,17 @@ def headers(mall_id: str, access_key: str, secret_key: str):
 
 def get_boards(mall_id: str, access_key: str, secret_key: str) -> List[Dict[str, Any]]:
     url = f"{BASE_URL}/v1/boards"
-    r = requests.get(url, headers=headers(mall_id, access_key, secret_key), verify=False, timeout=30)
-    r.raise_for_status()
-    print(r.text)
-    data = r.json()["result"]["data"]["boards"]
-    time.sleep(SLEEP_CONTENT)
-    return data
+    logging.info(f"[API] 보드 목록 조회 중...")
+    try:
+        r = requests.get(url, headers=headers(mall_id, access_key, secret_key), verify=False, timeout=30)
+        r.raise_for_status()
+        data = r.json()["result"]["data"]["boards"]
+        logging.info(f"[API] 보드 {len(data)}개 조회 완료")
+        time.sleep(SLEEP_CONTENT)
+        return data
+    except requests.exceptions.RequestException as e:
+        logging.error(f"[API] 보드 목록 조회 실패: {e}")
+        raise
 
 def upsert_boards(mall_id: str, boards: List[Dict[str, Any]]):
     sql = """
@@ -214,11 +223,15 @@ def get_contents_page(mall_id: str, access_key: str, secret_key: str, board_no: 
     params = {}
     if prev_content_pk is not None:
         params["prev__content_pk"] = prev_content_pk
-    r = requests.get(url, headers=headers(mall_id, access_key, secret_key), params=params, verify=False, timeout=60)
-    r.raise_for_status()
-    items = r.json()["result"]["data"]["items"]
-    time.sleep(SLEEP_CONTENT)
-    return items
+    try:
+        r = requests.get(url, headers=headers(mall_id, access_key, secret_key), params=params, verify=False, timeout=60)
+        r.raise_for_status()
+        items = r.json()["result"]["data"]["items"]
+        time.sleep(SLEEP_CONTENT)
+        return items
+    except requests.exceptions.RequestException as e:
+        logging.error(f"[API] 콘텐츠 목록 조회 실패 (board={board_no}, prev_pk={prev_content_pk}): {e}")
+        raise
 
 def upsert_contents_list(mall_id: str, board_no: int, items: List[Dict[str, Any]]):
     sql = """
@@ -268,13 +281,22 @@ def chunked(lst, n):
 
 def get_content_details(mall_id: str, access_key: str, secret_key: str, board_no: int, content_numbers: List[int]) -> List[Dict[str, Any]]:
     results = []
+    total_groups = (len(content_numbers) + 9) // 10
+    group_num = 0
     for group in chunked(content_numbers, 10):  # API 제한: 한 번에 10개까지만 처리 가능
+        group_num += 1
         ids = ",".join(map(str, group))
         url = f"{BASE_URL}/v1/boards/{board_no}/contents/{ids}"
-        r = requests.get(url, headers=headers(mall_id, access_key, secret_key), verify=False, timeout=60)
-        r.raise_for_status()
-        results.extend(r.json()["result"]["data"]["details"])
-        time.sleep(SLEEP_CONTENT)
+        try:
+            r = requests.get(url, headers=headers(mall_id, access_key, secret_key), verify=False, timeout=60)
+            r.raise_for_status()
+            details = r.json()["result"]["data"]["details"]
+            results.extend(details)
+            logging.debug(f"[API] 상세 조회 {group_num}/{total_groups} 완료 ({len(details)}개)")
+            time.sleep(SLEEP_CONTENT)
+        except requests.exceptions.RequestException as e:
+            logging.error(f"[API] 콘텐츠 상세 조회 실패 (board={board_no}, ids={ids}): {e}")
+            raise
     return results
 
 def upsert_content_details(mall_id: str, board_no: int, details: List[Dict[str, Any]]):
@@ -321,13 +343,25 @@ def upsert_content_details(mall_id: str, board_no: int, details: List[Dict[str, 
         logging.info(f"Inserted/Updated {len(rows)} content_details for mall_id={mall_id}, board_no={board_no}")
 
 def crawl_board_incremental(mall_id: str, access_key: str, secret_key: str, board_no: int):
+    logging.info(f"[Board {board_no}] 크롤링 시작")
     last_pk = get_checkpoint(mall_id, board_no)
     prev = last_pk if last_pk is not None else None
     max_seen = last_pk or 0
+    logging.info(f"[Board {board_no}] 체크포인트: last_pk={last_pk}")
 
     collected = []
+    page = 0
     while True:
-        items = get_contents_page(mall_id, access_key, secret_key, board_no, prev)
+        page += 1
+        try:
+            items = get_contents_page(mall_id, access_key, secret_key, board_no, prev)
+        except Exception as e:
+            logging.error(f"[Board {board_no}] 페이지 {page} 조회 중 에러: {e}")
+            # 에러 발생해도 지금까지 수집한 것은 저장
+            if max_seen > (last_pk or 0):
+                set_checkpoint(mall_id, board_no, max_seen)
+                logging.info(f"[Board {board_no}] 에러 전까지 체크포인트 저장: {max_seen}")
+            break
         if not items:
             break
         upsert_contents_list(mall_id, board_no, items)
@@ -335,18 +369,30 @@ def crawl_board_incremental(mall_id: str, access_key: str, secret_key: str, boar
         prev = items[-1]["content_pk"]
         max_seen = max(max_seen, prev)
 
+        # 매 페이지마다 체크포인트 저장 (중간에 죽어도 진행상황 유지)
+        set_checkpoint(mall_id, board_no, max_seen)
+
     if not collected:
-        logging.info(f"[board {board_no}] 신규 없음")
+        logging.info(f"[Board {board_no}] 신규 콘텐츠 없음")
         return
 
-    # 상세 일괄
+    logging.info(f"[Board {board_no}] {len(collected)}개 콘텐츠 수집 완료, 상세 조회 시작...")
+
+    # 상세 조회도 배치 단위로 저장 (10개씩)
     content_nos = [it["content_no"] for it in collected if it.get("content_no") is not None]
     if content_nos:
-        details = get_content_details(mall_id, access_key, secret_key, board_no, content_nos)
-        upsert_content_details(mall_id, board_no, details)
+        details_saved = 0
+        for group in chunked(content_nos, 10):
+            try:
+                details = get_content_details(mall_id, access_key, secret_key, board_no, list(group))
+                upsert_content_details(mall_id, board_no, details)
+                details_saved += len(details)
+                logging.info(f"[Board {board_no}] 상세 {details_saved}/{len(content_nos)} 저장")
+            except Exception as e:
+                logging.error(f"[Board {board_no}] 상세 조회 중 에러: {e}")
+                break  # 에러 발생해도 이미 저장된 것은 유지
 
-    set_checkpoint(mall_id, board_no, max_seen)
-    logging.info(f"[board {board_no}] 완료 last_content_pk={max_seen}")
+    logging.info(f"[Board {board_no}] 완료 (last_pk={max_seen})")
 
 def run(mode: str, mall_id: str):
     # 키 준비
@@ -375,6 +421,7 @@ def run(mode: str, mall_id: str):
         logging.error(f"전처리 중 오류 발생: {e}")
 
 if __name__ == "__main__":
+    logging.info("========== storybook_ingest.py 시작 ==========")
     parser = argparse.ArgumentParser()
     parser.add_argument("--mall-id", default=os.getenv("MALL_ID"), required=False)
     parser.add_argument("--mode", choices=["incremental", "full"], default="incremental")
@@ -385,4 +432,9 @@ if __name__ == "__main__":
     if not args.mall_id:
         raise SystemExit("--mall-id 또는 MALL_ID 필요")
 
-    run(args.mode, args.mall_id)
+    try:
+        run(args.mode, args.mall_id)
+        logging.info("========== storybook_ingest.py 완료 ==========")
+    except Exception as e:
+        logging.error(f"storybook_ingest.py 실패: {e}", exc_info=True)
+        raise

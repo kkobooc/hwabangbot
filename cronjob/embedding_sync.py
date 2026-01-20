@@ -7,6 +7,7 @@ embedding_sync.py
 """
 import os
 import logging
+import time
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 
@@ -36,7 +37,7 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
 COLL_TABLE = "processed_content_embeddings"
 SRC_TABLE = "processed_content"
 
-BATCH_SIZE = 128
+BATCH_SIZE = 64  # Rate limit 방지를 위해 배치 크기 축소
 MAX_TEXT_CHARS = int(os.getenv("MAX_DOC_CHARS", "3000"))
 
 # ---------- 임베딩 모델 ----------
@@ -139,12 +140,24 @@ def upsert_embeddings(conn, rows: List[Dict[str, Any]], vectors: List[List[float
         cur.executemany(q, data)
 
 
+def ensure_pgvector_extension(conn):
+    """pgvector extension 활성화 (register_vector 전에 필수)"""
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    conn.commit()
+    logging.info("pgvector extension 확인/활성화 완료")
+
+
 def main():
     with psycopg.connect(PG_CONN, autocommit=False) as conn:
+        # 순서 중요: extension 먼저 → register → 테이블 생성
+        ensure_pgvector_extension(conn)
         register_vector(conn)
         create_embeddings_table(conn)
 
+        logging.info("변경된 콘텐츠 조회 중...")
         rows = fetch_rows_for_embedding(conn)
+        logging.info(f"조회 완료: {len(rows)}개 발견")
         if not rows:
             logging.info("변경된(또는 신규) 콘텐츠가 없습니다")
             return
@@ -154,19 +167,38 @@ def main():
         logging.info(f"{total}개의 문서 임베딩/업서트 진행...")
 
         done = 0
+        batch_num = 0
         for idxs in chunked(list(range(total)), BATCH_SIZE):
-            batch_texts = [texts[i] for i in idxs]
-            vecs = EMB.embed_documents(batch_texts)
+            batch_num += 1
+            batch_size = len(idxs)
+            logging.info(f"[Batch {batch_num}] {batch_size}개 문서 임베딩 요청 중...")
 
-            batch_rows = [rows[i] for i in idxs]
-            upsert_embeddings(conn, batch_rows, vecs)
-            conn.commit()
+            try:
+                batch_texts = [texts[i] for i in idxs]
+                vecs = EMB.embed_documents(batch_texts)
+                logging.info(f"[Batch {batch_num}] 임베딩 완료, DB 저장 중...")
 
-            done += len(idxs)
-            logging.info(f"- {done}/{total} 완료")
+                batch_rows = [rows[i] for i in idxs]
+                upsert_embeddings(conn, batch_rows, vecs)
+                conn.commit()
+
+                done += batch_size
+                logging.info(f"[Batch {batch_num}] DB 저장 완료 - {done}/{total} ({done*100//total}%)")
+
+                # Rate limiting - API 호출 간 잠시 대기
+                time.sleep(1)
+            except Exception as e:
+                logging.error(f"[Batch {batch_num}] 에러 발생: {e}", exc_info=True)
+                raise
 
         logging.info("모든 임베딩/업서트 완료")
 
 
 if __name__ == "__main__":
-    main()
+    logging.info("========== embedding_sync.py 시작 ==========")
+    try:
+        main()
+        logging.info("========== embedding_sync.py 완료 ==========")
+    except Exception as e:
+        logging.error(f"embedding_sync.py 실패: {e}", exc_info=True)
+        raise

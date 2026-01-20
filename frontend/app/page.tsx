@@ -436,7 +436,7 @@ export default function ArtSuppliesChatbot() {
           </div>
         </div>
 
-        <div className="flex flex-col justify-end items-center px-4 h-[78px] min-h-[50px] absolute bottom-0 left-0 right-0 bg-white pb-6">
+        <div className="flex flex-col justify-end items-center px-4 h-[100px] min-h-[70px] absolute bottom-0 left-0 right-0 bg-white pb-4">
           <div className="w-full max-w-[680px]">
             <div className="relative bg-white border border-gray-200 rounded-full shadow-sm">
               <Input
@@ -455,6 +455,7 @@ export default function ArtSuppliesChatbot() {
                 <Send className="w-5 h-5" />
               </Button>
             </div>
+            <p className="text-center text-xs text-gray-400 mt-2">AI 큐레이터가 제공하는 답변이 완벽하지 않을 수 있으니 참고 기준으로 활용해 주세요.</p>
           </div>
         </div>
       </div>
@@ -476,7 +477,7 @@ export default function ArtSuppliesChatbot() {
         </ScrollArea>
       </div>
 
-      <div className="flex flex-col justify-end items-center px-4 h-[78px] min-h-[50px] absolute bottom-0 left-0 right-0 bg-white pb-6">
+      <div className="flex flex-col justify-end items-center px-4 h-[100px] min-h-[70px] absolute bottom-0 left-0 right-0 bg-white pb-4">
         <div className="w-full max-w-4xl">
           <div className="relative">
             <Input
@@ -495,6 +496,7 @@ export default function ArtSuppliesChatbot() {
               <Send className="w-4 h-4" />
             </Button>
           </div>
+          <p className="text-center text-xs text-gray-400 mt-2">AI 큐레이터가 제공하는 답변이 완벽하지 않을 수 있으니 참고 기준으로 활용해 주세요.</p>
         </div>
       </div>
     </div>
