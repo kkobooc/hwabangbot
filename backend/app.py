@@ -109,7 +109,9 @@ class RAGState(TypedDict, total=False):
     topic: Literal["art", "general"]
     confidence: float
     # 검색용 키워드 (query_rewrite에서 생성)
-    search_keyword: str
+    content_keyword: str   # 콘텐츠 검색용 (의도/행위 포함)
+    product_keyword: str   # 상품 API용 (상품 카테고리)
+    search_keyword: str    # 하위 호환용 (product_keyword와 동일)
     # 백워드 호환(없어도 동작)
     docs: List[Document]
     # 최종 출력
@@ -124,6 +126,8 @@ def _init_state(state: RAGState) -> RAGState:
     state.setdefault("errors", [])
     state.setdefault("topic", "general")
     state.setdefault("confidence", 0.0)
+    state.setdefault("content_keyword", "")
+    state.setdefault("product_keyword", "")
     state.setdefault("search_keyword", "")
     return state
 
@@ -153,38 +157,51 @@ async def query_classifier(state: RAGState):
 
 # ---------------- Query Rewriter ----------------
 class KeywordExtraction(TypedDict):
-    keyword: str
+    content_keyword: str   # 콘텐츠 검색용 (의도/행위 포함)
+    product_keyword: str   # 상품 API용 (상품 카테고리)
 
 async def query_rewrite(state: RAGState):
-    """사용자 질문에서 미술 재료 검색용 키워드를 추출"""
+    """사용자 질문에서 콘텐츠 검색용/상품 검색용 키워드를 각각 추출"""
     state = _init_state(state)
 
     rewrite_llm = llm.with_structured_output(KeywordExtraction).with_config({"run_name": "rewrite_llm"})
 
     rewrite_prompt = """
-    사용자의 미술 관련 질문에서 **상품 검색에 사용할 핵심 키워드**를 1~3개 단어로 추출하세요.
+    사용자의 미술 관련 질문에서 **두 가지 키워드**를 추출하세요.
+
+    1. content_keyword: 콘텐츠/정보 검색용 (질문의 의도/행위 포함)
+    2. product_keyword: 상품 검색용 (순수 상품 카테고리만)
 
     예시:
-    - "유화 그릴 때 좋은 물감 추천해주세요" → "유화 물감"
-    - "수채화 초보자인데 어떤 붓이 좋을까요?" → "수채화 붓"
-    - "캔버스에 아크릴로 그리고 싶어요" → "아크릴 캔버스"
-    - "세밀한 스케치용 연필 뭐가 좋아요?" → "세목 연필"
-    - "마카로 일러스트 그리려고 해요" → "일러스트 마카"
+    | 질문 | content_keyword | product_keyword |
+    |------|-----------------|-----------------|
+    | "유화 그릴 때 좋은 물감 추천해주세요" | "유화 물감 추천" | "유화 물감" |
+    | "아크릴 작업 후 굳어버린 붓은 어떻게 세척해?" | "아크릴 붓 세척 방법" | "아크릴 붓" |
+    | "수채화 물감으로 피부색 만들기가 어려워" | "수채화 피부색 혼합 방법" | "수채화 물감" |
+    | "유화를 빠르게 건조시킬 수 있는 방법" | "유화 건조 방법" | "유화 건조제" |
+    | "호분의 등급별 차이점이 뭐야?" | "호분 등급 차이" | "호분" |
+    | "어반스케치 기법에 대해 알고 싶어요" | "어반스케치 기법" | "어반스케치 도구" |
+    | "색연필 가격대별로 추천해줘" | "색연필 가격대별 추천" | "색연필" |
+    | "초등학생이 쓸만한 수채화물감" | "초등학생 수채화물감 추천" | "수채화물감" |
 
     규칙:
-    - 미술 재료/용품 카테고리를 포함 (물감, 붓, 캔버스, 연필, 팔레트 등)
-    - 재료 종류를 포함 (유화, 수채화, 아크릴, 파스텔 등)
-    - 간결하게 1~3단어로
+    - content_keyword: 질문의 의도(추천, 방법, 비교, 차이, 세척, 건조 등)를 포함. 2~5단어.
+    - product_keyword: 미술 재료/용품 카테고리만. 1~3단어.
 
     질문: {query}
     """
 
     try:
         result = await rewrite_llm.ainvoke(rewrite_prompt.format(query=state["query"]))
-        state["search_keyword"] = result["keyword"]
-        logging.info(f"[query_rewrite] 원본: '{state['query'][:50]}' → 키워드: '{state['search_keyword']}'")
+        state["content_keyword"] = result["content_keyword"]
+        state["product_keyword"] = result["product_keyword"]
+        # 하위 호환성을 위해 search_keyword도 설정
+        state["search_keyword"] = result["product_keyword"]
+        logging.info(f"[query_rewrite] 원본: '{state['query'][:50]}' → 콘텐츠: '{state['content_keyword']}', 상품: '{state['product_keyword']}'")
     except Exception as e:
         # 실패 시 원본 쿼리 사용
+        state["content_keyword"] = state["query"]
+        state["product_keyword"] = state["query"]
         state["search_keyword"] = state["query"]
         state["errors"].append(f"query_rewrite_error: {e}")
         logging.error(f"[query_rewrite] 오류: {e}, 원본 쿼리 사용")
@@ -339,15 +356,16 @@ async def synthesize_art(state: RAGState):
     state = _init_state(state)
 
     original_query = state["query"]
-    # search_keyword가 있으면 검색에 사용, 없으면 원본 쿼리 사용
-    search_kw = state.get("search_keyword") or original_query
-    logging.info(f"[synthesize_art] 시작: 원본='{original_query[:50]}', 검색키워드='{search_kw}'")
+    # 콘텐츠 검색용 키워드와 상품 검색용 키워드 분리
+    content_kw = state.get("content_keyword") or original_query
+    product_kw = state.get("product_keyword") or original_query
+    logging.info(f"[synthesize_art] 시작: 원본='{original_query[:50]}', 콘텐츠키워드='{content_kw}', 상품키워드='{product_kw}'")
 
-    # 콘텐츠 검색 + 추천 상품 API 병렬 호출 (search_keyword 사용)
+    # 콘텐츠 검색 (content_keyword) + 추천 상품 API (product_keyword) 병렬 호출
     async def safe_search_content():
         try:
-            result = await search_content(search_kw)
-            logging.info(f"[synthesize_art] search_content 성공 (키워드: {search_kw}, 길이: {len(result)})")
+            result = await search_content(content_kw)
+            logging.info(f"[synthesize_art] search_content 성공 (키워드: {content_kw}, 길이: {len(result)})")
             return result
         except Exception as e:
             logging.error(f"[synthesize_art] search_content 오류: {e}")
@@ -356,8 +374,8 @@ async def synthesize_art(state: RAGState):
 
     async def safe_fetch_recommendations():
         try:
-            result = await fetch_recommendations(search_kw)
-            logging.info(f"[synthesize_art] fetch_recommendations 성공 (키워드: {search_kw}, 길이: {len(result)})")
+            result = await fetch_recommendations(product_kw)
+            logging.info(f"[synthesize_art] fetch_recommendations 성공 (키워드: {product_kw}, 길이: {len(result)})")
             logging.info(f"[synthesize_art] recommendations 첫 300자: {result[:300]}")
             return result
         except Exception as e:
