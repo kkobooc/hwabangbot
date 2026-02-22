@@ -248,6 +248,23 @@ export default function ArtSuppliesChatbot() {
         }, 100)
       }
 
+      // start 이벤트: 서버 연결 확인 (타임아웃 방지)
+      eventSource.addEventListener("start", () => {
+        gotAnyToken = true
+        console.log("SSE stream started")
+      })
+
+      // node 이벤트: 워크플로우 진행 상황 (타임아웃 방지)
+      eventSource.addEventListener("node", (e) => {
+        gotAnyToken = true
+        try {
+          const { name, status } = JSON.parse(e.data)
+          console.log(`Node ${name}: ${status}`)
+        } catch {
+          // ignore parse errors
+        }
+      })
+
       eventSource.addEventListener("token", (e) => {
         if (isCompleted) return
 

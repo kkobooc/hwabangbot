@@ -85,9 +85,12 @@ async def stream(body: QueryIn):
     thread = body.thread_id or f"api-{uuid.uuid4().hex}"
     
     async def event_stream():
+        # 즉시 start 이벤트 전송 (클라이언트 타임아웃 방지)
+        yield await sse_event("start", {"thread_id": thread})
+
         try:
             first_chain_end = False
-            
+
             # astream_events로 세부 이벤트까지 받기
             async for ev in langgraph_app.astream_events(
                 {"query": body.query},
@@ -119,7 +122,7 @@ async def stream(body: QueryIn):
                 # 노드 시작/종료 이벤트
                 elif kind in ["on_chain_start", "on_chain_end"]:
                     name = data.get("name", "")
-                    if name in ["classify", "query_rewrite", "synthesize_art", "synthesize_general"]:
+                    if name in ["classify_and_rewrite", "synthesize_art", "synthesize_general"]:
                         yield await sse_event("node", {"name": name, "status": kind})
                 
                 # 최종 결과
@@ -143,6 +146,9 @@ async def stream_get(query: str, thread_id: str | None = None):
     thread = thread_id or f"api-{uuid.uuid4().hex}"
 
     async def event_stream():
+        # 즉시 start 이벤트 전송 (클라이언트 타임아웃 방지)
+        yield await sse_event("start", {"thread_id": thread})
+
         try:
             first_chain_end = False
 
@@ -172,7 +178,7 @@ async def stream_get(query: str, thread_id: str | None = None):
 
                 elif kind in ["on_chain_start", "on_chain_end"]:
                     name = data.get("name", "")
-                    if name in ["classify", "query_rewrite", "synthesize_art", "synthesize_general"]:
+                    if name in ["classify_and_rewrite", "synthesize_art", "synthesize_general"]:
                         yield await sse_event("node", {"name": name, "status": kind})
 
                 elif kind == "on_chain_end" and data.get("name") == "__start__":

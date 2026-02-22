@@ -32,10 +32,31 @@ export async function GET(req: Request) {
       })
     }
 
-    return new Response(response.body, {
+    // 스트리밍을 명시적으로 처리 (버퍼링 방지)
+    const reader = response.body?.getReader()
+    const stream = new ReadableStream({
+      async start(controller) {
+        if (!reader) {
+          controller.close()
+          return
+        }
+        try {
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            controller.enqueue(value)
+          }
+        } finally {
+          controller.close()
+        }
+      },
+    })
+
+    return new Response(stream, {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
         Connection: "keep-alive",
       },
     })

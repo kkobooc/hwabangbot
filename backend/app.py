@@ -1,5 +1,6 @@
 import os, json, random, logging, sys
-from typing import Any, TypedDict, List, Literal, Optional
+from typing import Annotated, Any, TypedDict, List, Literal, Optional
+import operator
 from dotenv import load_dotenv
 
 print("[APP] app.py loading started", flush=True)
@@ -13,6 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 print("[APP] importing langgraph modules...", flush=True)
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
@@ -69,7 +71,8 @@ llm = ChatOpenAI(
     temperature=LLM_TEMPERATURE,
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
-    tags=["final"]  # ← synthesize 노드에서 쓰는 LLM이라면 최종답에만 달기
+    streaming=True,  # ← 토큰 단위 스트리밍 활성화
+    tags=["final"]
 )
 print("[APP] ChatOpenAI created", flush=True)
 
@@ -83,7 +86,7 @@ print("[APP] OpenAIEmbeddings created", flush=True)
 
 # ---------------- PG Engine 생성 ----------------
 print("[APP] Creating SQLAlchemy engine...", flush=True)
-engine = create_engine(PG_CONN)
+engine = create_engine(PG_CONN, pool_size=5, max_overflow=10)
 print("[APP] SQLAlchemy engine created", flush=True)
 
 # ---------------- Retriever 초기화 ----------------
@@ -100,10 +103,6 @@ retriever = PGRawRetriever(
 print("[APP] PGRawRetriever created", flush=True)
 
 # ---------------- 상태 정의 ----------------
-class QueryClassification(TypedDict):
-    topic: Literal["art", "general"]
-    confidence: float
-
 class RAGState(TypedDict, total=False):
     query: str
     topic: Literal["art", "general"]
@@ -111,105 +110,83 @@ class RAGState(TypedDict, total=False):
     # 검색용 키워드 (query_rewrite에서 생성)
     content_keyword: str   # 콘텐츠 검색용 (의도/행위 포함)
     product_keyword: str   # 상품 API용 (상품 카테고리)
-    search_keyword: str    # 하위 호환용 (product_keyword와 동일)
-    # 백워드 호환(없어도 동작)
-    docs: List[Document]
     # 최종 출력
     answer: str
-    # 디버깅/로그용
-    messages: List[BaseMessage]
-    errors: List[str]
+    # 대화 히스토리 (add_messages 리듀서로 자동 누적)
+    messages: Annotated[list[BaseMessage], add_messages]
+    errors: Annotated[list[str], operator.add]
 
-def _init_state(state: RAGState) -> RAGState:
-    state.setdefault("docs", [])
-    state.setdefault("messages", [])
-    state.setdefault("errors", [])
-    state.setdefault("topic", "general")
-    state.setdefault("confidence", 0.0)
-    state.setdefault("content_keyword", "")
-    state.setdefault("product_keyword", "")
-    state.setdefault("search_keyword", "")
-    return state
-
-# ---------------- Query Classifier ----------------
-async def query_classifier(state: RAGState):
-    """LLM 기반 쿼리 분류"""
-    state = _init_state(state)
-    classifier_llm = llm.with_structured_output(QueryClassification).with_config({"run_name": "classifier_llm"})
-
-    classification_prompt = """
-    다음 질문을 분석해서 미술/미술용품 관련인지 판단해주세요.
-    - 미술/미술용품 관련이면 topic='art'
-    - 아니면 topic='general'
-    결과는 JSON( topic, confidence )으로.
-
-    질문: {query}
-    """
-    try:
-        result = await classifier_llm.ainvoke(classification_prompt.format(query=state["query"]))
-        state["topic"] = result["topic"]
-        state["confidence"] = float(result["confidence"])
-    except Exception as e:
-        state["topic"] = "general"
-        state["confidence"] = 0.5
-        state["errors"].append(f"classifier_error: {e}")
-    return state
-
-# ---------------- Query Rewriter ----------------
-class KeywordExtraction(TypedDict):
+# ---------------- Query Classifier + Rewriter (통합) ----------------
+class ClassifyAndRewrite(TypedDict):
+    topic: Literal["art", "general"]
+    confidence: float
     content_keyword: str   # 콘텐츠 검색용 (의도/행위 포함)
     product_keyword: str   # 상품 API용 (상품 카테고리)
 
-async def query_rewrite(state: RAGState):
-    """사용자 질문에서 콘텐츠 검색용/상품 검색용 키워드를 각각 추출"""
-    state = _init_state(state)
+async def classify_and_rewrite(state: RAGState):
+    """LLM 1회 호출로 분류 + 키워드 추출 동시 수행"""
+    import time
+    t0 = time.time()
 
-    rewrite_llm = llm.with_structured_output(KeywordExtraction).with_config({"run_name": "rewrite_llm"})
+    combined_llm = llm.with_structured_output(ClassifyAndRewrite).with_config({"run_name": "classify_rewrite_llm"})
 
-    rewrite_prompt = """
-    사용자의 미술 관련 질문에서 **두 가지 키워드**를 추출하세요.
+    combined_prompt = """
+    다음 질문을 분석하세요.
 
-    1. content_keyword: 콘텐츠/정보 검색용 (질문의 의도/행위 포함)
-    2. product_keyword: 상품 검색용 (순수 상품 카테고리만)
+    ## 1단계: 분류
+    - 미술/미술용품 관련 질문이면 topic='art'
+    - 아니면 topic='general'
+    - confidence: 확신도 (0.0 ~ 1.0)
+
+    ## 2단계: 키워드 추출 (topic='art'인 경우만 의미 있음)
+    - content_keyword: 콘텐츠 검색용 (질문 의도 포함, 2~5단어)
+    - product_keyword: 상품 검색용 (2~4단어)
+      - 단순 카테고리명만 쓰지 말고, 질문에 언급된 미술 관련 수식어를 포함하라
+      - 포함해야 할 수식어 유형: 용도(수채화용, 세밀화용), 재질/결(황목, 중목, 세목),
+        수준(초보자용, 전문가용), 규격/사이즈(6호, F형), 특성(소프트, 하드, 두꺼운),
+        기법(유화, 아크릴, 수채) 등
 
     예시:
-    | 질문 | content_keyword | product_keyword |
-    |------|-----------------|-----------------|
-    | "유화 그릴 때 좋은 물감 추천해주세요" | "유화 물감 추천" | "유화 물감" |
-    | "아크릴 작업 후 굳어버린 붓은 어떻게 세척해?" | "아크릴 붓 세척 방법" | "아크릴 붓" |
-    | "수채화 물감으로 피부색 만들기가 어려워" | "수채화 피부색 혼합 방법" | "수채화 물감" |
-    | "유화를 빠르게 건조시킬 수 있는 방법" | "유화 건조 방법" | "유화 건조제" |
-    | "호분의 등급별 차이점이 뭐야?" | "호분 등급 차이" | "호분" |
-    | "어반스케치 기법에 대해 알고 싶어요" | "어반스케치 기법" | "어반스케치 도구" |
-    | "색연필 가격대별로 추천해줘" | "색연필 가격대별 추천" | "색연필" |
-    | "초등학생이 쓸만한 수채화물감" | "초등학생 수채화물감 추천" | "수채화물감" |
-
-    규칙:
-    - content_keyword: 질문의 의도(추천, 방법, 비교, 차이, 세척, 건조 등)를 포함. 2~5단어.
-    - product_keyword: 미술 재료/용품 카테고리만. 1~3단어.
+    | 질문 | topic | content_keyword | product_keyword |
+    |------|-------|-----------------|-----------------|
+    | "유화 물감 추천해주세요" | art | "유화 물감 추천" | "유화 물감" |
+    | "아크릴 붓 세척 방법" | art | "아크릴 붓 세척 방법" | "아크릴 붓 세척" |
+    | "오늘 날씨 어때?" | general | "" | "" |
+    | "색연필 가격대별 추천" | art | "색연필 가격대별 추천" | "색연필" |
+    | "초보자용 수채화 물감 추천" | art | "초보자 수채화 물감 추천" | "초보자용 수채화 물감" |
+    | "세밀화 그리기 좋은 펜" | art | "세밀화 펜 추천" | "세밀화용 펜" |
+    | "황목 캔버스 추천해주세요" | art | "황목 캔버스 추천" | "황목 캔버스" |
+    | "소프트 파스텔 초보자 추천" | art | "소프트 파스텔 초보자 추천" | "초보자용 소프트 파스텔" |
 
     질문: {query}
     """
 
     try:
-        result = await rewrite_llm.ainvoke(rewrite_prompt.format(query=state["query"]))
-        state["content_keyword"] = result["content_keyword"]
-        state["product_keyword"] = result["product_keyword"]
-        # 하위 호환성을 위해 search_keyword도 설정
-        state["search_keyword"] = result["product_keyword"]
-        logging.info(f"[query_rewrite] 원본: '{state['query'][:50]}' → 콘텐츠: '{state['content_keyword']}', 상품: '{state['product_keyword']}'")
+        result = await combined_llm.ainvoke(combined_prompt.format(query=state["query"]))
+        updates = {
+            "topic": result["topic"],
+            "confidence": float(result["confidence"]),
+            "content_keyword": result.get("content_keyword", ""),
+            "product_keyword": result.get("product_keyword", ""),
+        }
+        logging.info(f"[TIMING] classify_and_rewrite: {time.time()-t0:.2f}초")
+        logging.info(f"[classify_and_rewrite] topic={updates['topic']}, 콘텐츠='{updates['content_keyword']}', 상품='{updates['product_keyword']}'")
+        return updates
     except Exception as e:
-        # 실패 시 원본 쿼리 사용
-        state["content_keyword"] = state["query"]
-        state["product_keyword"] = state["query"]
-        state["search_keyword"] = state["query"]
-        state["errors"].append(f"query_rewrite_error: {e}")
-        logging.error(f"[query_rewrite] 오류: {e}, 원본 쿼리 사용")
-
-    return state
+        logging.error(f"[classify_and_rewrite] 오류: {e}")
+        return {
+            "topic": "general",
+            "confidence": 0.5,
+            "content_keyword": state["query"],
+            "product_keyword": state["query"],
+            "errors": [f"classify_and_rewrite_error: {e}"],
+        }
 
 # ---------------- 콘텐츠/상품 검색 함수 ----------------
 import asyncio
+import httpx
+
+_http_client = httpx.AsyncClient(timeout=10.0)
 
 def _search_content_sync(query: str) -> str:
     """미술 DB에서 관련 콘텐츠를 찾아 포맷팅된 문자열로 반환합니다."""
@@ -231,7 +208,8 @@ def _search_content_sync(query: str) -> str:
         lines = []
         for i, item in enumerate(selected, 1):
             md = item.metadata or {}
-            snippet = (item.page_content or "")[:MAX_DOC_CHARS] + "..."
+            # LLM이 요약하도록 300자 전달
+            snippet = (item.page_content or "")[:300]
 
             lines.append(
                 f"- 콘텐츠제목_{i}: {md.get('title', '제목 없음')}\n"
@@ -251,83 +229,77 @@ async def search_content(query: str) -> str:
 
 async def fetch_recommendations(query: str) -> str:
     """추천 상품 API를 호출해 포맷팅된 문자열로 반환합니다."""
-    import httpx
     api_url = "https://cafe24-recommendation-app-df9427a2b14e.herokuapp.com/api/v1/search-recommendations/kangkd78910"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(api_url, params={"keyword": query, "limit": 5}, headers={"Accept": "application/json"})
-            if r.status_code != 200:
-                return f"(추천상품 API 오류: {r.status_code})"
+        r = await _http_client.get(api_url, params={"keyword": query, "limit": 5}, headers={"Accept": "application/json"})
+        if r.status_code != 200:
+            return f"(추천상품 API 오류: {r.status_code})"
 
-            data = r.json()
-            recs = data.get("recommendations", [])
+        data = r.json()
+        recs = data.get("recommendations", [])
 
-            # 디버그: 이미지 URL 확인 로깅
-            for i, rec in enumerate(recs[:5], 1):
-                img = rec.get('image_small', '')
-                logging.info(f"[추천상품 #{i}] name={rec.get('product_name', '')[:30]}, image_small={img[:80] if img else 'EMPTY'}")
-            
-            if not recs:
-                return "(추천상품 없음)"
-            
-            out = []
-            # 가격 문자열을 안전하게 정수 원화로 표기하는 유틸
-            from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-            def format_won(val: Any) -> str:
+        # 디버그: 이미지 URL 확인 로깅
+        for i, rec in enumerate(recs[:5], 1):
+            img = rec.get('image_small', '')
+            logging.info(f"[추천상품 #{i}] name={rec.get('product_name', '')[:30]}, image_small={img[:80] if img else 'EMPTY'}")
+
+        if not recs:
+            return "(추천상품 없음)"
+
+        out = []
+        from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+        def format_won(val: Any) -> str:
+            try:
+                d = Decimal(str(val))
+                q = int(d.to_integral_value(rounding=ROUND_HALF_UP))
+                return f"{q:,}원"
+            except (InvalidOperation, ValueError, TypeError):
+                try:
+                    q = int(float(val))
+                    return f"{q:,}원"
+                except Exception:
+                    return f"{val}원"
+
+        for i, rec in enumerate(recs[:4], 1):
+            price = rec.get('price', '0')
+            sale_price = rec.get('sale_price', '0')
+            img_url = rec.get('image_small', '')
+            if not img_url:
+                logging.warning(f"[추천상품 #{i}] 이미지 URL 누락! product_name={rec.get('product_name', '')}")
+
+            def to_int(val: Any) -> int:
                 try:
                     d = Decimal(str(val))
-                    q = int(d.to_integral_value(rounding=ROUND_HALF_UP))
-                    return f"{q:,}원"
-                except (InvalidOperation, ValueError, TypeError):
+                    return int(d.to_integral_value(rounding=ROUND_HALF_UP))
+                except Exception:
                     try:
-                        q = int(float(val))
-                        return f"{q:,}원"
+                        return int(float(val))
                     except Exception:
-                        return f"{val}원"
+                        return 0
 
-            for i, rec in enumerate(recs[:4], 1):
-                price = rec.get('price', '0')
-                sale_price = rec.get('sale_price', '0')
-                img_url = rec.get('image_small', '')
-                if not img_url:
-                    logging.warning(f"[추천상품 #{i}] 이미지 URL 누락! product_name={rec.get('product_name', '')}")
+            p = to_int(price)
+            s = to_int(sale_price)
 
-                # 숫자 비교용 안전 변환
-                def to_int(val: Any) -> int:
-                    try:
-                        d = Decimal(str(val))
-                        return int(d.to_integral_value(rounding=ROUND_HALF_UP))
-                    except Exception:
-                        try:
-                            return int(float(val))
-                        except Exception:
-                            return 0
+            if p > 0 and s > 0 and p != s:
+                discounted = min(p, s)
+                regular = max(p, s)
+                price_display = f"{format_won(discounted)} <s>{format_won(regular)}</s>"
+            else:
+                regular = max(p, s)
+                price_display = format_won(regular)
 
-                p = to_int(price)
-                s = to_int(sale_price)
+            product_url = rec.get('product_url', '')
+            product_url = product_url.replace('kangkd78910.cafe24.com', 'hwabang.net')
 
-                if p > 0 and s > 0 and p != s:
-                    discounted = min(p, s)
-                    regular = max(p, s)
-                    price_display = f"{format_won(discounted)} <s>{format_won(regular)}</s>"
-                else:
-                    # 둘 중 하나가 0이거나 동일하면 할인가 없음 → 정가만 표기
-                    regular = max(p, s)
-                    price_display = format_won(regular)
-                    
-                # cafe24 도메인을 hwabang.net으로 변환
-                product_url = rec.get('product_url', '')
-                product_url = product_url.replace('kangkd78910.cafe24.com', 'hwabang.net')
+            out.append(
+                f"- 추천상품명{i}: {rec.get('product_name', '').replace('<br>', ' ')}\n"
+                f"  추천이미지{i}: {rec.get('image_small', '')}\n"
+                f"  추천링크{i}: {product_url}\n"
+                f"  추천상품번호{i}: {rec.get('product_no', '')}\n"
+                f"  추천상품가격{i}: {price_display}\n"
+            )
 
-                out.append(
-                    f"- 추천상품명{i}: {rec.get('product_name', '').replace('<br>', ' ')}\n"
-                    f"  추천이미지{i}: {rec.get('image_small', '')}\n"
-                    f"  추천링크{i}: {product_url}\n"
-                    f"  추천상품번호{i}: {rec.get('product_no', '')}\n"
-                    f"  추천상품가격{i}: {price_display}\n"
-                )
-            
-            return "\n".join(out)
+        return "\n".join(out)
     except Exception as e:
         return f"(추천상품 오류: {e})"
 
@@ -353,67 +325,72 @@ RAG_PROMPT = ChatPromptTemplate.from_messages([
 
 async def synthesize_art(state: RAGState):
     """도구를 직접 호출하여 정보 수집 후 최종 답변 생성"""
-    state = _init_state(state)
+    import time
+    t0 = time.time()
+    errors = []
 
     original_query = state["query"]
-    # 콘텐츠 검색용 키워드와 상품 검색용 키워드 분리
     content_kw = state.get("content_keyword") or original_query
     product_kw = state.get("product_keyword") or original_query
     logging.info(f"[synthesize_art] 시작: 원본='{original_query[:50]}', 콘텐츠키워드='{content_kw}', 상품키워드='{product_kw}'")
 
-    # 콘텐츠 검색 (content_keyword) + 추천 상품 API (product_keyword) 병렬 호출
     async def safe_search_content():
+        t_start = time.time()
         try:
             result = await search_content(content_kw)
-            logging.info(f"[synthesize_art] search_content 성공 (키워드: {content_kw}, 길이: {len(result)})")
+            logging.info(f"[TIMING] search_content: {time.time()-t_start:.2f}초")
             return result
         except Exception as e:
             logging.error(f"[synthesize_art] search_content 오류: {e}")
-            state["errors"].append(f"search_content error: {e}")
+            errors.append(f"search_content error: {e}")
             return f"(검색 오류: {e})"
 
     async def safe_fetch_recommendations():
+        t_start = time.time()
         try:
             result = await fetch_recommendations(product_kw)
-            logging.info(f"[synthesize_art] fetch_recommendations 성공 (키워드: {product_kw}, 길이: {len(result)})")
-            logging.info(f"[synthesize_art] recommendations 첫 300자: {result[:300]}")
+            logging.info(f"[TIMING] fetch_recommendations: {time.time()-t_start:.2f}초")
             return result
         except Exception as e:
             logging.error(f"[synthesize_art] fetch_recommendations 오류: {e}")
-            state["errors"].append(f"fetch_recommendations error: {e}")
+            errors.append(f"fetch_recommendations error: {e}")
             return f"(추천상품 오류: {e})"
 
-    # 병렬 실행
+    t_parallel = time.time()
     sources, recommendations_text = await asyncio.gather(
         safe_search_content(),
         safe_fetch_recommendations()
     )
+    logging.info(f"[TIMING] 병렬검색 총: {time.time()-t_parallel:.2f}초")
 
-    logging.info(f"[synthesize_art] 최종 - sources 길이: {len(sources)}, recommendations 길이: {len(recommendations_text)}")
-
-    # 대화 히스토리 포함: 직전 메시지들과 현재 질문을 함께 전달
     prior_messages: List[BaseMessage] = state.get("messages", [])
     current_prompt_messages = RAG_PROMPT.format_messages(
         query=state["query"],
         sources=sources,
         recommendations=recommendations_text
     )
-    # 프롬프트 템플릿이 생성한 메시지 앞에 기존 히스토리를 붙임
     input_messages: List[BaseMessage] = [*prior_messages, *current_prompt_messages]
 
-    # 여러 방법으로 run_name 설정 시도
     answer_llm = llm.with_config({
         "run_name": "answer_llm",
         "metadata": {"run_name": "answer_llm"},
         "tags": ["answer_llm"]
     })
+    t_llm = time.time()
     out = await answer_llm.ainvoke(input_messages)
-    state["answer"] = out.content
-    # 메모리에 이번 턴 히스토리 추가
-    state["messages"].extend([
-        HumanMessage(content=state["query"]),
-        AIMessage(content=state["answer"])])
-    return state
+    logging.info(f"[TIMING] answer_llm: {time.time()-t_llm:.2f}초")
+    logging.info(f"[TIMING] synthesize_art 총: {time.time()-t0:.2f}초")
+
+    result = {
+        "answer": out.content,
+        "messages": [
+            HumanMessage(content=state["query"]),
+            AIMessage(content=out.content),
+        ],
+    }
+    if errors:
+        result["errors"] = errors
+    return result
 
 async def synthesize_general(state: RAGState):
     """일반 질문 기본 답변"""
@@ -426,7 +403,6 @@ async def synthesize_general(state: RAGState):
     질문: {query}
     """
     try:
-        # 여러 방법으로 run_name 설정 시도
         answer_llm = llm.with_config({
             "run_name": "answer_llm",
             "metadata": {"run_name": "answer_llm"},
@@ -435,38 +411,38 @@ async def synthesize_general(state: RAGState):
         prior_messages: List[BaseMessage] = state.get("messages", [])
         this_turn = [HumanMessage(content=general_prompt.format(query=state["query"]))]
         response = await answer_llm.ainvoke([*prior_messages, *this_turn])
-        state["answer"] = response.content
-        state["messages"].extend([
-            HumanMessage(content=state["query"]),
-            AIMessage(content=state["answer"])])
+        return {
+            "answer": response.content,
+            "messages": [
+                HumanMessage(content=state["query"]),
+                AIMessage(content=response.content),
+            ],
+        }
     except Exception as e:
-        state["answer"] = "죄송합니다. 현재 답변을 생성할 수 없습니다. 미술 관련 질문이시라면 더 정확한 답변을 드릴 수 있어요! 😊"
-        state.setdefault("errors", []).append(f"synthesize_general_error: {e}")
-    return state
+        return {
+            "answer": "죄송합니다. 현재 답변을 생성할 수 없습니다. 미술 관련 질문이시라면 더 정확한 답변을 드릴 수 있어요! 😊",
+            "errors": [f"synthesize_general_error: {e}"],
+        }
 
 # ---------------- Graph ----------------
 graph = StateGraph(RAGState)
 
-graph.add_node("classify", query_classifier)
-graph.add_node("query_rewrite", query_rewrite)
+graph.add_node("classify_and_rewrite", classify_and_rewrite)
 graph.add_node("synthesize_art", synthesize_art)
 graph.add_node("synthesize_general", synthesize_general)
 
-# START → classify
-graph.add_edge(START, "classify")
+# START → classify_and_rewrite
+graph.add_edge(START, "classify_and_rewrite")
 
-# classify → query_rewrite (art) 또는 synthesize_general (general)
+# classify_and_rewrite → synthesize_art (art) 또는 synthesize_general (general)
 def route_after_classify(state: RAGState):
-    return "query_rewrite" if state["topic"] == "art" else "synthesize_general"
+    return "synthesize_art" if state["topic"] == "art" else "synthesize_general"
 
 graph.add_conditional_edges(
-    "classify",
+    "classify_and_rewrite",
     route_after_classify,
-    {"query_rewrite": "query_rewrite", "synthesize_general": "synthesize_general"}
+    {"synthesize_art": "synthesize_art", "synthesize_general": "synthesize_general"}
 )
-
-# query_rewrite → synthesize_art
-graph.add_edge("query_rewrite", "synthesize_art")
 
 graph.add_edge("synthesize_art", END)
 graph.add_edge("synthesize_general", END)

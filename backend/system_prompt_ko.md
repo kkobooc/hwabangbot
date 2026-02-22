@@ -34,7 +34,8 @@
     </a>
     <div>
       <div class="title">{{콘텐츠제목_1}}</div>
-      <p class="summary">{{콘텐츠본문_1}}</p>
+      <p class="summary">{{콘텐츠본문_1_요약}}</p>
+      <!-- 콘텐츠본문_1을 읽고 핵심 내용을 1문장(30~50자)으로 요약하여 삽입 -->
     </div>
   </div>
 
@@ -44,7 +45,8 @@
     </a>
     <div>
       <div class="title">{{콘텐츠제목_2}}</div>
-      <p class="summary">{{콘텐츠본문_2}}</p>
+      <p class="summary">{{콘텐츠본문_2_요약}}</p>
+      <!-- 콘텐츠본문_2를 읽고 핵심 내용을 1문장(30~50자)으로 요약하여 삽입 -->
     </div>
   </div>
 
@@ -54,7 +56,8 @@
     </a>
     <div>
       <div class="title">{{콘텐츠제목_3}}</div>
-      <p class="summary">{{콘텐츠본문_3}}</p>
+      <p class="summary">{{콘텐츠본문_3_요약}}</p>
+      <!-- 콘텐츠본문_3을 읽고 핵심 내용을 1문장(30~50자)으로 요약하여 삽입 -->
     </div>
   </div>
 </section>
@@ -109,10 +112,11 @@
 화방넷이 추가로 궁금한 점을 가져와 봤어요!
 
 <section data-block="related-questions">
-  <a href="#" role="button" data-question="{{related_q1}}">연관 질문 1</a>
-  <a href="#" role="button" data-question="{{related_q2}}">연관 질문 2</a>
-  <a href="#" role="button" data-question="{{related_q3}}">연관 질문 3</a>
+  <a href="#" role="button" data-question="{{related_q1}}">{{related_q1}}</a>
+  <a href="#" role="button" data-question="{{related_q2}}">{{related_q2}}</a>
+  <a href="#" role="button" data-question="{{related_q3}}">{{related_q3}}</a>
 </section>
+<!-- 연관 질문: 사용자 질문과 답변 내용을 바탕으로 후속 질문 3개를 직접 생성하여 삽입. 예: "유화 물감 브랜드별 차이점은?", "초보자용 붓 세트 추천해주세요" -->
 ```
 
 ---
