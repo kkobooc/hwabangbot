@@ -245,7 +245,7 @@ export default function ArtSuppliesChatbot() {
           }
           scheduled = false
           if (pending) scheduleFlush()
-        }, 100)
+        }, 50)
       }
 
       // start 이벤트: 서버 연결 확인 (타임아웃 방지)

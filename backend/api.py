@@ -28,6 +28,15 @@ api = FastAPI(title="hwabang-ai API", version="0.1.0")
 
 @api.on_event("startup")
 async def startup_event():
+    try:
+        from app import emb, engine
+        from sqlalchemy import text
+        await emb.aembed_query("warmup")
+        with engine.begin() as c:
+            c.execute(text("SELECT 1"))
+        print("[API] Connection warmup complete", flush=True)
+    except Exception as e:
+        print(f"[API] Warmup warning: {e}", flush=True)
     print("[API] FastAPI startup complete - ready to serve requests", flush=True)
 
 @api.on_event("shutdown")
