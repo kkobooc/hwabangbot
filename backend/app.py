@@ -65,6 +65,8 @@ else:
 
 # ---------------- LLM/Embeddings ----------------
 # (OPENAI_BASE_URL이 있으면 해당 엔드포인트 사용)
+CLASSIFY_MODEL = os.environ.get("CLASSIFY_MODEL", "gpt-4o-mini")
+
 print(f"[APP] Creating ChatOpenAI (model={LLM_MODEL})...", flush=True)
 llm = ChatOpenAI(
     model=LLM_MODEL,
@@ -75,6 +77,15 @@ llm = ChatOpenAI(
     tags=["final"]
 )
 print("[APP] ChatOpenAI created", flush=True)
+
+print(f"[APP] Creating classify LLM (model={CLASSIFY_MODEL})...", flush=True)
+classify_llm = ChatOpenAI(
+    model=CLASSIFY_MODEL,
+    temperature=0,
+    api_key=OPENAI_API_KEY,
+    base_url=OPENAI_BASE_URL,
+)
+print("[APP] Classify LLM created", flush=True)
 
 print(f"[APP] Creating OpenAIEmbeddings (model={EMBEDDING_MODEL})...", flush=True)
 emb = OpenAIEmbeddings(
@@ -128,7 +139,7 @@ async def classify_and_rewrite(state: RAGState):
     import time
     t0 = time.time()
 
-    combined_llm = llm.with_structured_output(ClassifyAndRewrite).with_config({"run_name": "classify_rewrite_llm"})
+    combined_llm = classify_llm.with_structured_output(ClassifyAndRewrite).with_config({"run_name": "classify_rewrite_llm"})
 
     combined_prompt = """
     다음 질문을 분석하세요.
